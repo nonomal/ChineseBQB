@@ -1,0 +1,162 @@
+name: Build and deploy ChineseBQB
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.event_name == 'pull_request' && github.ref || 'production' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HUGO_VERSION: 0.162.1
+      HUGO_ENVIRONMENT: production
+      TZ: Asia/Shanghai
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-site.txt
+      - name: Install image tools
+        run: python -m pip install -r requirements-site.txt
+      - name: Install Hugo
+        run: |
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/hugo.tar.gz" "https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_${HUGO_VERSION}_linux-amd64.tar.gz"
+          mkdir -p "$RUNNER_TEMP/hugo-bin"
+          tar -xzf "$RUNNER_TEMP/hugo.tar.gz" -C "$RUNNER_TEMP/hugo-bin" hugo
+          echo "$RUNNER_TEMP/hugo-bin" >> "$GITHUB_PATH"
+      - name: Restore thumbnails
+        uses: actions/cache@v4
+        with:
+          path: .hugo-cache
+          key: bqb-thumbnails-v1-${{ runner.os }}-${{ github.sha }}
+          restore-keys: bqb-thumbnails-v1-${{ runner.os }}-
+      - name: Test folder lifecycle and downloads
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Generate and build site
+        run: python scripts/build_site.py build
+      - name: Verify every page and image reference
+        run: python scripts/verify_site.py
+      - name: Upload README directory
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: readme-directory
+          path: |
+            .hugo-generated/readme-directory.md
+            .hugo-generated/downloads/manifest.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload generated ZIP archives
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bqb-downloads
+          path: .hugo-generated/downloads
+          include-hidden-files: true
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: public-hugo
+
+  publish-downloads:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout ZIP publisher
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/publish_downloads.py
+          sparse-checkout-cone-mode: false
+      - name: Download generated ZIP archives
+        uses: actions/download-artifact@v4
+        with:
+          name: bqb-downloads
+          path: ${{ runner.temp }}/bqb-downloads
+      - name: Publish and verify ZIP direct downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/publish_downloads.py publish --manifest "$RUNNER_TEMP/bqb-downloads/manifest.json"
+
+  deploy:
+    needs: publish-downloads
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  update-readme:
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout README updater
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            README.md
+            scripts/update_readme.py
+            scripts/publish_downloads.py
+          sparse-checkout-cone-mode: false
+      - name: Download deployed README directory
+        uses: actions/download-artifact@v4
+        with:
+          name: readme-directory
+          path: ${{ runner.temp }}/readme-directory
+      - name: Update README after successful deployment
+        run: |
+          git fetch --depth=1 origin master
+          if [ "$(git rev-parse FETCH_HEAD)" != "$GITHUB_SHA" ]; then
+            echo "A newer source commit exists; its deployment will update README."
+            exit 0
+          fi
+          python scripts/update_readme.py apply --directory "$RUNNER_TEMP/readme-directory/readme-directory.md"
+          git add README.md
+          if git diff --cached --quiet; then
+            echo "README is already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update README directory from published BQB folders"
+          if ! git push origin HEAD:master; then
+            git fetch --depth=1 origin master
+            if [ "$(git rev-parse FETCH_HEAD)" != "$GITHUB_SHA" ]; then
+              echo "Source changed during the update; the next deployment will refresh README."
+              exit 0
+            fi
+            exit 1
+          fi
+      - name: Remove unused generated ZIP archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/publish_downloads.py prune --manifest "$RUNNER_TEMP/readme-directory/downloads/manifest.json"

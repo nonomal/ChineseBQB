@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Check the built project subpath, category lifecycle, and every local asset."""
+from html.parser import HTMLParser
+import json
+from pathlib import Path
+import sys
+import hashlib
+import zipfile
+from urllib.parse import unquote, urljoin, urlsplit
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def verify(public=ROOT / "public-hugo", base="https://zhaoolee.com/ChineseBQB/"):
+    base_url = urlsplit(base)
+    references = set()
+    home_images = set()
+    errors = []
+
+    def check(value, page_url=base):
+        if not value or value.startswith(("#", "data:", "blob:", "mailto:", "tel:")):
+            return
+        url = urlsplit(urljoin(page_url, value))
+        if url.netloc != base_url.netloc:
+            return
+        if not url.path.startswith(base_url.path):
+            # The author homepage is an intentional external navigation link.
+            if url.path != "/":
+                errors.append(f"Subpath escaped: {value}")
+            return
+        relative = unquote(url.path[len(base_url.path):])
+        path = public / relative
+        if url.path.endswith("/"):
+            path /= "index.html"
+        references.add(path)
+        if not path.is_file():
+            errors.append(f"Missing: {path.relative_to(public)} (from {page_url})")
+
+    class Links(HTMLParser):
+        def __init__(self, url):
+            super().__init__()
+            self.url = url
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "img" and self.url == urljoin(base, "index.html"):
+                home_images.add(urljoin(base, dict(attrs).get("src", "")))
+            for key, value in attrs:
+                if key in {"src", "href", "action", "data-src"}:
+                    check(value, self.url)
+
+    pages = list(public.rglob("*.html"))
+    if not pages:
+        raise ValueError("没有生成 HTML 页面")
+    for path in pages:
+        Links(urljoin(base, path.relative_to(public).as_posix())).feed(path.read_text(encoding="utf-8"))
+    import re
+    for path in public.rglob("*.css"):
+        for match in re.findall(r"url\(['\"]?([^)'\"]+)", path.read_text(encoding="utf-8")):
+            check(match, urljoin(base, path.relative_to(public).as_posix()))
+    catalog = json.loads((public / "catalog/index.json").read_text())
+    count = 0
+    download_images = {}
+    for category in catalog["categories"]:
+        check(category["url"])
+        cover = category["cover"]
+        if cover:
+            expected_cover = cover["src"] if cover["animated"] else cover["thumb"]
+            if urljoin(base, expected_cover) not in home_images:
+                errors.append(f"Incorrect homepage cover: {category['folder']}")
+        if (public / "categories" / category["slug"]).exists():
+            errors.append(f"Unexpected obsolete short route: {category['slug']}")
+        images = json.loads((public / "catalog" / f"{category['slug']}.json").read_text())
+        if category["count"]:
+            download_images[category["download"]] = images
+        if len(images) != category["count"]:
+            errors.append(f"Incorrect count: {category['slug']}")
+        count += len(images)
+        for image in images:
+            check(image["src"])
+            check(image["thumb"])
+    search = json.loads((public / "catalog/search.json").read_text())
+    for image in search:
+        check(image["categoryUrl"])
+    if count != catalog["total"] or len(search) != count:
+        errors.append("Search index and category counts differ")
+    mirror = public / "v2fy" / "chinesebqb_v2fy.json"
+    mirror_count = 0
+    if not mirror.is_file():
+        errors.append("Missing: v2fy/chinesebqb_v2fy.json")
+    else:
+        mirror_items = json.loads(mirror.read_text())["data"]
+        mirror_count = len(mirror_items)
+        if mirror_count != count:
+            errors.append("v2fy mirror index and image counts differ")
+        for item in mirror_items:
+            check(item["url"])
+    if (public / "CNAME").exists():
+        errors.append("Project site must inherit the account domain; do not publish a CNAME")
+    if any(path.is_symlink() for path in public.rglob("*")):
+        errors.append("Pages artifact contains symlinks")
+    downloads = public.parent / ".hugo-generated/downloads"
+    manifest = json.loads((downloads / "manifest.json").read_text())
+    if {asset["url"] for asset in manifest["assets"]} != {c["download"] for c in catalog["categories"] if c["count"]}:
+        errors.append("Download manifest and category links differ")
+    for asset in manifest["assets"]:
+        archive = downloads / asset["name"]
+        if archive.stat().st_size != asset["size"] or hashlib.sha256(archive.read_bytes()).hexdigest() != asset["sha256"]:
+            errors.append(f"ZIP checksum mismatch: {asset['name']}")
+        with zipfile.ZipFile(archive) as package:
+            images = download_images.get(asset["url"], [])
+            if package.namelist() != [image["path"] for image in images]:
+                errors.append(f"ZIP filenames differ from category: {asset['name']}")
+                continue
+            for image in images:
+                if hashlib.sha256(package.read(image["path"])).hexdigest() != Path(image["src"]).stem:
+                    errors.append(f"ZIP original image differs: {asset['name']} / {image['path']}")
+    if errors:
+        raise ValueError("\n".join(errors[:30]))
+    print(f"验证通过：{len(pages)} 个 HTML 页面、{len(catalog['categories'])} 个分类、{count} 张图片、{len(references)} 个本地引用、{len(manifest['assets'])} 个 ZIP 原图合集、v2fy 镜像索引 {mirror_count} 条。")
+
+
+if __name__ == "__main__":
+    try:
+        verify()
+    except (ValueError, OSError) as error:
+        sys.exit(str(error))
